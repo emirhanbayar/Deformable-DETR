@@ -81,8 +81,12 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 @torch.no_grad()
 def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir):
+    import json
     model.eval()
     criterion.eval()
+
+    pred_id = 0
+    all_predictions = []
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
@@ -90,7 +94,6 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
 
     iou_types = tuple(k for k in ('segm', 'bbox') if k in postprocessors.keys())
     coco_evaluator = CocoEvaluator(base_ds, iou_types)
-    # coco_evaluator.coco_eval[iou_types[0]].params.iouThrs = [0, 0.1, 0.5, 0.75]
 
     panoptic_evaluator = None
     if 'panoptic' in postprocessors.keys():
@@ -108,7 +111,7 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
 
-        # reduce losses over all GPUs for logging purposes
+        # Reduce losses for logging
         loss_dict_reduced = utils.reduce_dict(loss_dict)
         loss_dict_reduced_scaled = {k: v * weight_dict[k]
                                     for k, v in loss_dict_reduced.items() if k in weight_dict}
@@ -121,6 +124,27 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
 
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
         results = postprocessors['bbox'](outputs, orig_target_sizes)
+
+        # Collect predictions
+        for target, output in zip(targets, results):
+            image_id = target['image_id'].item()
+            scores = output['scores']
+            labels = output['labels']
+            boxes = output['boxes']  # These boxes are in pixel coordinates
+            for score, label, box in zip(scores, labels, boxes):
+                prediction = {}
+                prediction['id'] = pred_id
+                pred_id += 1
+                prediction['image_id'] = image_id
+                prediction['category_id'] = label.item()
+                xmin, ymin, xmax, ymax = box.tolist()
+                width = xmax - xmin
+                height = ymax - ymin
+                prediction['bbox'] = [xmin, ymin, width, height]
+                prediction['area'] = width * height
+                prediction['score'] = score.item()
+                all_predictions.append(prediction)
+
         if 'segm' in postprocessors.keys():
             target_sizes = torch.stack([t["size"] for t in targets], dim=0)
             results = postprocessors['segm'](results, outputs, orig_target_sizes, target_sizes)
@@ -138,7 +162,7 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
 
             panoptic_evaluator.update(res_pano)
 
-    # gather the stats from all processes
+    # Gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     if coco_evaluator is not None:
@@ -146,7 +170,7 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
     if panoptic_evaluator is not None:
         panoptic_evaluator.synchronize_between_processes()
 
-    # accumulate predictions from all images
+    # Accumulate predictions from all images
     if coco_evaluator is not None:
         coco_evaluator.accumulate()
         coco_evaluator.summarize()
@@ -163,4 +187,21 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
         stats['PQ_all'] = panoptic_res["All"]
         stats['PQ_th'] = panoptic_res["Things"]
         stats['PQ_st'] = panoptic_res["Stuff"]
+
+    # Gather predictions from all processes
+    predictions = utils.all_gather(all_predictions)
+
+    if utils.is_main_process():
+        # Merge predictions
+        merged_predictions = []
+        for p in predictions:
+            merged_predictions.extend(p)
+        # Reassign unique IDs
+        for idx, pred in enumerate(merged_predictions):
+            pred['id'] = idx
+        output_dict = {'predictions': merged_predictions}
+        predictions_path = os.path.join(output_dir, 'predictions.json')
+        with open(predictions_path, 'w') as f:
+            json.dump(output_dict, f)
+
     return stats, coco_evaluator
