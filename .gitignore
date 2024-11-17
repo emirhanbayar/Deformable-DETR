@@ -1,0 +1,10 @@
+__pycache__/
+*.pth
+*.pt
+
+*.egg-info
+*.egg
+
+build/
+
+outputs/
