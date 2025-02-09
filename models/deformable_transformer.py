@@ -19,6 +19,81 @@ from torch.nn.init import xavier_uniform_, constant_, uniform_, normal_
 from util.misc import inverse_sigmoid
 from models.ops.modules import MSDeformAttn
 
+import matplotlib.pyplot as plt
+
+import os
+
+def modify_init_box_proposals(topk, targets):
+    """
+    Modify initial box proposals to prioritize target boxes
+    Args:
+        topk: [B, num_queries, 4] tensor of initial box proposals 
+        targets: list of dicts containing 'boxes' key with GT boxes
+    Returns:
+        modified proposals with GT boxes as priority
+    """
+    device = topk.device
+    batch_size, num_queries, _ = topk.shape
+    
+    # Initialize with inverse sigmoid of 0.5
+    new_proposals = inverse_sigmoid(torch.full_like(topk, 0.5))
+    
+    for b in range(batch_size):
+        # Get GT boxes
+        gt_boxes = targets[b]['boxes']  # [num_gt, 4]
+        num_gt = len(gt_boxes)
+        
+        # Use all GT boxes first
+        if num_gt <= num_queries:
+            new_proposals[b, :num_gt] = inverse_sigmoid(gt_boxes)
+            
+            # # For remaining queries, use empty boxes outside image
+            new_proposals[b, num_gt:] = inverse_sigmoid(torch.tensor([[-0.002, -0.002, -0.001, -0.001]]).repeat(num_queries - num_gt, 1).to(device))
+        else:
+            # If more GT boxes than queries, use the first num_queries GT boxes
+            new_proposals[b] = inverse_sigmoid(gt_boxes[:num_queries])
+    
+    return new_proposals
+
+def denormalize_image(tensor):
+    """Denormalize image tensor using ImageNet mean and std"""
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(tensor.device)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(tensor.device)
+    tensor = tensor * std + mean
+    tensor = torch.clamp(tensor, 0, 1)
+    return tensor
+
+def draw_reference_points(ax, refpoints, color='red', linewidth=1):
+    """Helper function to draw reference points"""
+    refpoints = refpoints.cpu().numpy()
+    for refpoint in refpoints:
+        x, y, w, h = refpoint
+        ax.add_patch(plt.Rectangle((x-w/2, y-h/2), w, h, fill=False, color=color, linewidth=linewidth))
+
+def visualize_refpoints(image, refpoints, save_path):
+    # Denormalize the image
+    image = denormalize_image(image)
+    
+    # Convert image tensor to numpy array
+    image_np = image.cpu().permute(1, 2, 0).numpy()
+    
+    # Create figure and axis
+    fig, ax = plt.subplots(1, figsize=(12, 12))
+    
+    # Display the image
+    ax.imshow(image_np)
+    
+    # Draw reference points
+    draw_reference_points(ax, refpoints, color='red', linewidth=2)
+    
+    # Set title and turn off axis
+    ax.set_title('Reference Points')
+    ax.axis('off')
+    
+    # Save the figure
+    plt.savefig(save_path, bbox_inches='tight', pad_inches=0.1, dpi=300)
+    plt.close(fig)
+
 
 class DeformableTransformer(nn.Module):
     def __init__(self, d_model=256, nhead=8,
@@ -28,6 +103,7 @@ class DeformableTransformer(nn.Module):
                  two_stage=False, two_stage_num_proposals=300):
         super().__init__()
 
+        self.current_iteration = 0
         self.d_model = d_model
         self.nhead = nhead
         self.two_stage = two_stage
@@ -123,7 +199,7 @@ class DeformableTransformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, srcs, masks, pos_embeds, query_embed=None):
+    def forward(self, samples, targets, srcs, masks, pos_embeds, query_embed=None):
         assert self.two_stage or query_embed is not None
 
         # prepare input for encoder
@@ -158,12 +234,13 @@ class DeformableTransformer(nn.Module):
             output_memory, output_proposals = self.gen_encoder_output_proposals(memory, mask_flatten, spatial_shapes)
 
             # hack implementation for two-stage Deformable DETR
-            enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory)
-            enc_outputs_coord_unact = self.decoder.bbox_embed[self.decoder.num_layers](output_memory) + output_proposals
+            enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory)                          # [B, num_queries, num_classes]
+            enc_outputs_coord_unact = self.decoder.bbox_embed[self.decoder.num_layers](output_memory) + output_proposals  # [B, num_queries, 4]
 
             topk = self.two_stage_num_proposals
             topk_proposals = torch.topk(enc_outputs_class[..., 0], topk, dim=1)[1]
             topk_coords_unact = torch.gather(enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4))
+            # topk_coords_unact = modify_init_box_proposals(topk_coords_unact, targets)
             topk_coords_unact = topk_coords_unact.detach()
             reference_points = topk_coords_unact.sigmoid()
             init_reference_out = reference_points
@@ -175,6 +252,25 @@ class DeformableTransformer(nn.Module):
             tgt = tgt.unsqueeze(0).expand(bs, -1, -1)
             reference_points = self.reference_points(query_embed).sigmoid()
             init_reference_out = reference_points
+
+        # # Create debug folder if it doesn't exist
+        # os.makedirs("debug", exist_ok=True)
+
+        # # Visualize refpoints
+        # image = samples.tensors[0]  # Assume batch size 1
+        # refpoints = init_reference_out[0]
+
+        # # Convert refpoints to pixel coordinates
+        # h, w = image.shape[-2:]
+        # refpoints_pixel = refpoints.clone()
+        # refpoints_pixel[:, 0] *= w
+        # refpoints_pixel[:, 1] *= h
+        # refpoints_pixel[:, 2] *= w
+        # refpoints_pixel[:, 3] *= h
+
+        # save_path = f"debug/refpoints_{self.current_iteration}.png"
+        # visualize_refpoints(image, refpoints_pixel, save_path)
+        # self.current_iteration += 1  # Increment iteration counter
 
         # decoder
         hs, inter_references = self.decoder(tgt, reference_points, memory,
